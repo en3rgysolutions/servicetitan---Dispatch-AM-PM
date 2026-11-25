@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ServiceTitan Arrival Window AM/PM Badge
 // @namespace    https://github.com/YOUR_USER/YOUR_REPO
-// @version      1.2.0
+// @version      1.2.1
 // @description  Fixed AM/PM badge (from the job's arrival window) on Daily Dispatch Board bubbles
 // @match        https://go.servicetitan.com/*
 // @run-at       document-idle
