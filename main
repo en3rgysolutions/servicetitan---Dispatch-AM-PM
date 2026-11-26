@@ -1,20 +1,21 @@
 // ==UserScript==
 // @name         ServiceTitan Arrival Window AM/PM Badge
-// @namespace    https://github.com/YOUR_USER/YOUR_REPO
-// @version      1.2.1
-// @description  Fixed AM/PM badge (from the job's arrival window) on Daily Dispatch Board bubbles
+// @namespace    en3rgysolutions
+// @version      2.0.1
+// @description  AM/PM badge from the job's arrival window (network read + hover fallback)
 // @match        https://go.servicetitan.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/st-arrival-ampm.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/st-arrival-ampm.user.js
+// @updateURL    https://raw.githubusercontent.com/en3rgysolutions/servicetitan---Dispatch-AM-PM/main/st-arrival-ampm.user.js
+// @downloadURL  https://raw.githubusercontent.com/en3rgysolutions/servicetitan---Dispatch-AM-PM/main/st-arrival-ampm.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const SHOW_STATUS        = false;  // true = show counts at bottom-left
-  const LEARN_ONCE_ON_LOAD = false;  // true = auto-hover visible bubbles ~4s after load
+  const SHOW_STATUS = false;           // true = show counts at bottom-left
+  const LEARN_ONCE_ON_LOAD = false;
+  const TZ = 'Australia/Adelaide';
   const KEY = 'st_arrival_window_v1';
 
   let cache = {};
@@ -22,176 +23,236 @@
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cache)); } catch (e) {} };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---------- small UI (ignored by the observer) ----------
-  const ui = document.createElement('div');
-  ui.style.cssText =
-    'position:fixed;left:6px;bottom:6px;z-index:999999;display:flex;gap:6px;align-items:center;font:11px sans-serif;';
-  const status = document.createElement('span');
-  status.style.cssText = 'background:#222;color:#fff;padding:3px 7px;border-radius:5px;opacity:.85;';
-  const btn = document.createElement('button');
-  btn.textContent = 'Learn visible';
-  btn.style.cssText = 'font:11px sans-serif;padding:3px 7px;border-radius:5px;cursor:pointer;opacity:.7;';
-  ui.appendChild(btn);
-  if (SHOW_STATUS) ui.appendChild(status);
-  document.body.appendChild(ui);
+  let netCount = 0;
+  let onNewData = () => {};
 
-  // ---------- shadow roots ----------
-  const roots = [document];
-  const observed = new WeakSet();
-  let lastDiscover = 0;
+  // ================= NETWORK READER (runs at document-start) =================
+  function minutesOf(v) {
+    if (v == null) return null;
+    if (typeof v === 'string' && /^\d{1,2}:\d{2}/.test(v) && !/[-T]/.test(v)) {
+      const [h, m] = v.split(':'); return +h * 60 + +m;
+    }
+    const d = new Date(v);
+    if (isNaN(d)) return null;
+    const p = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+    return (+p.find((x) => x.type === 'hour').value % 24) * 60 + +p.find((x) => x.type === 'minute').value;
+  }
+  const fmt = (min) => {
+    const h = Math.floor(min / 60), m = min % 60, ap = h >= 12 ? 'pm' : 'am';
+    return ((h % 12) || 12) + ':' + String(m).padStart(2, '0') + ' ' + ap;
+  };
+  function store(id, s, e) {
+    if (id == null || s == null) return;
+    const info = { label: s < 720 ? 'AM' : 'PM', text: fmt(s) + (e != null ? ' - ' + fmt(e) : '') };
+    const k = String(id), old = cache[k];
+    if (!old || old.label !== info.label || old.text !== info.text) { cache[k] = info; netCount++; return true; }
+  }
+  function walk(o, depth) {
+    if (!o || typeof o !== 'object' || depth > 12) return false;
+    let changed = false;
+    if (Array.isArray(o)) { o.forEach((x) => { if (walk(x, depth + 1)) changed = true; }); return changed; }
+    const keys = Object.keys(o);
+    const id = o.jobAppointmentId ?? o.appointmentId ?? o.id;
+    const ks = keys.find((k) => /arrival.*(start|from)/i.test(k));
+    const ke = keys.find((k) => /arrival.*(end|to)\b/i.test(k));
+    if (ks && id != null && store(id, minutesOf(o[ks]), ke ? minutesOf(o[ke]) : null)) changed = true;
+    const aw = keys.find((k) => /^arrival.?window$/i.test(k));
+    if (aw && o[aw] && typeof o[aw] === 'object' && id != null) {
+      const w = o[aw];
+      const wk = Object.keys(w);
+      const s = wk.find((k) => /start|from/i.test(k)), e = wk.find((k) => /end|to$/i.test(k));
+      if (s && store(id, minutesOf(w[s]), e ? minutesOf(w[e]) : null)) changed = true;
+    }
+    keys.forEach((k) => { if (walk(o[k], depth + 1)) changed = true; });
+    return changed;
+  }
+  function ingest(text) {
+    if (typeof text !== 'string' || !/arrival/i.test(text)) return;
+    try {
+      if (walk(JSON.parse(text), 0)) { save(); onNewData(); }
+    } catch (e) {}
+  }
 
-  function discoverRoots(force) {
-    const now = Date.now();
-    if (!force && now - lastDiscover < 3000) return;
-    lastDiscover = now;
-    const seen = new Set(roots);
-    for (let i = 0; i < roots.length; i++) {
-      roots[i].querySelectorAll('*').forEach((el) => {
-        if (el.shadowRoot && !seen.has(el.shadowRoot)) {
-          seen.add(el.shadowRoot);
-          roots.push(el.shadowRoot);
-        }
+  const _fetch = window.fetch;
+  window.fetch = function () {
+    const p = _fetch.apply(this, arguments);
+    p.then((res) => {
+      try { if ((res.headers.get('content-type') || '').includes('json')) res.clone().text().then(ingest); } catch (e) {}
+    }).catch(() => {});
+    return p;
+  };
+  const _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function () {
+    this.addEventListener('load', () => {
+      try { if (this.responseType === '' || this.responseType === 'text') ingest(this.responseText); } catch (e) {}
+    });
+    return _open.apply(this, arguments);
+  };
+
+  // ================= DOM PART (waits for the page) =================
+  function init() {
+    const ui = document.createElement('div');
+    ui.style.cssText = 'position:fixed;left:6px;bottom:6px;z-index:999999;display:flex;gap:6px;align-items:center;font:11px sans-serif;';
+    const status = document.createElement('span');
+    status.style.cssText = 'background:#222;color:#fff;padding:3px 7px;border-radius:5px;opacity:.85;';
+    const btn = document.createElement('button');
+    btn.textContent = 'Learn visible';
+    btn.style.cssText = 'font:11px sans-serif;padding:3px 7px;border-radius:5px;cursor:pointer;opacity:.7;';
+    ui.appendChild(btn);
+    if (SHOW_STATUS) ui.appendChild(status);
+    document.body.appendChild(ui);
+
+    const roots = [document];
+    const observed = new WeakSet();
+    let lastDiscover = 0;
+    function discoverRoots(force) {
+      const now = Date.now();
+      if (!force && now - lastDiscover < 3000) return;
+      lastDiscover = now;
+      const seen = new Set(roots);
+      for (let i = 0; i < roots.length; i++) {
+        roots[i].querySelectorAll('*').forEach((el) => {
+          if (el.shadowRoot && !seen.has(el.shadowRoot)) { seen.add(el.shadowRoot); roots.push(el.shadowRoot); }
+        });
+      }
+      roots.forEach((r) => { if (!observed.has(r)) { observed.add(r); mo.observe(r, { childList: true, subtree: true }); } });
+    }
+
+    const toMin = (t) => {
+      const m = t.trim().match(/(\d{1,2}):(\d{2})\s*([ap])m/i);
+      if (!m) return null;
+      let h = +m[1] % 12; if (m[3].toLowerCase() === 'p') h += 12;
+      return h * 60 + +m[2];
+    };
+    function parseWindow(text) {
+      const m = text.match(/Arrival Window:\s*(\d{1,2}:\d{2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)/i);
+      if (!m) return null;
+      const s = toMin(m[1]);
+      return s === null ? null : { label: s < 720 ? 'AM' : 'PM', text: m[1] + ' - ' + m[2] };
+    }
+    const triggerOf = (card) => card.closest('[data-cy="wdb-job-appt-card-with-popover"]');
+    const popoverOf = (card) => {
+      const t = triggerOf(card);
+      return t && t.parentElement ? t.parentElement.querySelector('[data-cy="dc-job-popover"]') : null;
+    };
+    function readPopover(card) {
+      const pop = popoverOf(card);
+      const info = pop && parseWindow(pop.textContent || '');
+      if (!info) return false;
+      const id = card.dataset.jobAppointmentId;
+      const old = cache[id];
+      if (!old || old.label !== info.label || old.text !== info.text) { cache[id] = info; save(); }
+      return true;
+    }
+
+    function setBadge(row, info) {
+      let b = row.querySelector('.ampm-badge');
+      if (!info) { if (b) b.remove(); return; }
+      if (!b) {
+        b = document.createElement('span');
+        b.className = 'ampm-badge';
+        b.style.cssText = 'flex:none;font:bold 10px sans-serif;padding:0 4px;border-radius:6px;line-height:14px;border:1px solid #000;';
+        row.insertBefore(b, row.firstChild);
+      }
+      if (b.textContent !== info.label) {
+        b.textContent = info.label;
+        const am = info.label === 'AM';
+        b.style.background = am ? '#fff' : '#000';
+        b.style.color = am ? '#000' : '#fff';
+        b.title = 'Arrival window: ' + info.text;
+      }
+    }
+
+    function allCards() {
+      const out = [];
+      roots.forEach((r) => r.querySelectorAll('[data-cy="wdb-job-appt-card"]').forEach((c) => out.push(c)));
+      return out;
+    }
+
+    let lastStatus = '';
+    function applyBadges() {
+      discoverRoots(false);
+      let n = 0, known = 0;
+      allCards().forEach((card) => {
+        const id = card.dataset.jobAppointmentId;
+        const row = card.querySelector('[class*="card-content-row"]');
+        if (!id || !row) return;
+        n++;
+        readPopover(card);
+        const info = cache[id];
+        if (info) known++;
+        setBadge(row, info);
+      });
+      if (SHOW_STATUS) {
+        const s = 'AW v2.0.1 | bubbles=' + n + ' | known=' + known + ' | fromNetwork=' + netCount + ' | cached=' + Object.keys(cache).length;
+        if (s !== lastStatus) { lastStatus = s; status.textContent = s; }
+      }
+    }
+
+    const isBadge = (n) => n.nodeType === 1 && n.classList && n.classList.contains('ampm-badge');
+    let queued = false;
+    function schedule() {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; applyBadges(); });
+    }
+    const mo = new MutationObserver((records) => {
+      let relevant = false;
+      for (const m of records) {
+        if (ui.contains(m.target)) continue;
+        if (m.addedNodes.length === 0) continue;
+        if ([...m.addedNodes].every(isBadge)) continue;
+        relevant = true; break;
+      }
+      if (relevant) schedule();
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+    onNewData = schedule;
+
+    function fire(el, types) {
+      types.forEach((ty) => {
+        const C = ty.startsWith('pointer') ? PointerEvent : MouseEvent;
+        el.dispatchEvent(new C(ty, { bubbles: true, composed: true, cancelable: true, view: window }));
       });
     }
-    roots.forEach((r) => {
-      if (!observed.has(r)) { observed.add(r); mo.observe(r, { childList: true, subtree: true }); }
-    });
-  }
-
-  // ---------- parsing / cache ----------
-  const toMin = (t) => {
-    const m = t.trim().match(/(\d{1,2}):(\d{2})\s*([ap])m/i);
-    if (!m) return null;
-    let h = +m[1] % 12; if (m[3].toLowerCase() === 'p') h += 12;
-    return h * 60 + +m[2];
-  };
-  function parseWindow(text) {
-    const m = text.match(/Arrival Window:\s*(\d{1,2}:\d{2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)/i);
-    if (!m) return null;
-    const s = toMin(m[1]);
-    return s === null ? null : { label: s < 720 ? 'AM' : 'PM', text: m[1] + ' - ' + m[2] };
-  }
-  const triggerOf = (card) => card.closest('[data-cy="wdb-job-appt-card-with-popover"]');
-  const popoverOf = (card) => {
-    const t = triggerOf(card);
-    return t && t.parentElement ? t.parentElement.querySelector('[data-cy="dc-job-popover"]') : null;
-  };
-  function readPopover(card) {
-    const pop = popoverOf(card);
-    const info = pop && parseWindow(pop.textContent || '');
-    if (!info) return false;
-    const id = card.dataset.jobAppointmentId;
-    const old = cache[id];
-    if (!old || old.label !== info.label || old.text !== info.text) { cache[id] = info; save(); }
-    return true;
-  }
-
-  // ---------- badges: AM = white/black, PM = black/white, unknown = none ----------
-  function setBadge(row, info) {
-    let b = row.querySelector('.ampm-badge');
-    if (!info) { if (b) b.remove(); return; }
-    if (!b) {
-      b = document.createElement('span');
-      b.className = 'ampm-badge';
-      b.style.cssText =
-        'flex:none;font:bold 10px sans-serif;padding:0 4px;border-radius:6px;line-height:14px;border:1px solid #000;';
-      row.insertBefore(b, row.firstChild);
+    let busy = false;
+    async function learnOne(card) {
+      const trig = triggerOf(card);
+      if (!trig) return;
+      fire(trig, ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove']);
+      for (let i = 0; i < 6; i++) { await sleep(250); if (readPopover(card)) break; }
+      fire(trig, ['pointerout', 'pointerleave', 'mouseout', 'mouseleave']);
+      await sleep(150);
     }
-    if (b.textContent !== info.label) {
-      b.textContent = info.label;
-      const am = info.label === 'AM';
-      b.style.background = am ? '#fff' : '#000';
-      b.style.color = am ? '#000' : '#fff';
-      b.title = 'Arrival window: ' + info.text;
+    async function learnVisible() {
+      if (busy) return;
+      busy = true; btn.disabled = true;
+      const todo = allCards().filter((c) => {
+        const r = c.getBoundingClientRect();
+        return !cache[c.dataset.jobAppointmentId] && r.width > 0 && r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
+      });
+      for (let i = 0; i < todo.length; i++) {
+        btn.textContent = 'Learning ' + (i + 1) + '/' + todo.length;
+        await learnOne(todo[i]);
+      }
+      applyBadges();
+      btn.textContent = 'Learn visible';
+      btn.disabled = false; busy = false;
     }
-  }
+    btn.addEventListener('click', learnVisible);
 
-  function allCards() {
-    const out = [];
-    roots.forEach((r) => r.querySelectorAll('[data-cy="wdb-job-appt-card"]').forEach((c) => out.push(c)));
-    return out;
-  }
+    document.addEventListener('mouseover', (e) => {
+      const card = e.composedPath().find((el) => el.matches && el.matches('[data-cy="wdb-job-appt-card"]'));
+      if (card && !cache[card.dataset.jobAppointmentId]) {
+        setTimeout(() => { if (readPopover(card)) applyBadges(); }, 700);
+      }
+    }, true);
 
-  let lastStatus = '';
-  function applyBadges() {
-    discoverRoots(false);
-    let n = 0, known = 0;
-    allCards().forEach((card) => {
-      const id = card.dataset.jobAppointmentId;
-      const row = card.querySelector('[class*="card-content-row"]');
-      if (!id || !row) return;
-      n++;
-      readPopover(card);
-      const info = cache[id];
-      if (info) known++;
-      setBadge(row, info);
-    });
-    if (SHOW_STATUS) {
-      const s = 'AW v1.2.0 | bubbles=' + n + ' | known=' + known + ' | cached=' + Object.keys(cache).length;
-      if (s !== lastStatus) { lastStatus = s; status.textContent = s; }
-    }
-  }
-
-  // ---------- observer: ignores our own changes, applies before next paint ----------
-  const isBadge = (n) => n.nodeType === 1 && n.classList && n.classList.contains('ampm-badge');
-  let queued = false;
-  const mo = new MutationObserver((records) => {
-    let relevant = false;
-    for (const m of records) {
-      if (ui.contains(m.target)) continue;                         // our status/button
-      if (m.addedNodes.length === 0) continue;                     // only removals: nothing to add
-      if ([...m.addedNodes].every(isBadge)) continue;              // our own badge insert
-      relevant = true; break;
-    }
-    if (!relevant || queued) return;
-    queued = true;
-    requestAnimationFrame(() => { queued = false; applyBadges(); });
-  });
-  mo.observe(document.body, { childList: true, subtree: true });
-
-  // ---------- learning (on demand only) ----------
-  function fire(el, types) {
-    types.forEach((ty) => {
-      const C = ty.startsWith('pointer') ? PointerEvent : MouseEvent;
-      el.dispatchEvent(new C(ty, { bubbles: true, composed: true, cancelable: true, view: window }));
-    });
-  }
-  let busy = false;
-  async function learnOne(card) {
-    const trig = triggerOf(card);
-    if (!trig) return;
-    fire(trig, ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove']);
-    for (let i = 0; i < 6; i++) { await sleep(250); if (readPopover(card)) break; }
-    fire(trig, ['pointerout', 'pointerleave', 'mouseout', 'mouseleave']);
-    await sleep(150);
-  }
-  async function learnVisible() {
-    if (busy) return;
-    busy = true; btn.disabled = true;
-    const todo = allCards().filter((c) => {
-      const r = c.getBoundingClientRect();
-      return !cache[c.dataset.jobAppointmentId] && r.width > 0 &&
-             r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
-    });
-    for (let i = 0; i < todo.length; i++) {
-      btn.textContent = 'Learning ' + (i + 1) + '/' + todo.length;
-      await learnOne(todo[i]);
-    }
+    discoverRoots(true);
     applyBadges();
-    btn.textContent = 'Learn visible';
-    btn.disabled = false; busy = false;
+    if (LEARN_ONCE_ON_LOAD) setTimeout(learnVisible, 4000);
   }
-  btn.addEventListener('click', learnVisible);
 
-  // learn from your own real hovers
-  document.addEventListener('mouseover', (e) => {
-    const card = e.composedPath().find((el) => el.matches && el.matches('[data-cy="wdb-job-appt-card"]'));
-    if (card && !cache[card.dataset.jobAppointmentId]) {
-      setTimeout(() => { if (readPopover(card)) applyBadges(); }, 700);
-    }
-  }, true);
-
-  discoverRoots(true);
-  applyBadges();
-  if (LEARN_ONCE_ON_LOAD) setTimeout(learnVisible, 4000);
+  if (document.body) init();
+  else document.addEventListener('DOMContentLoaded', init);
 })();
